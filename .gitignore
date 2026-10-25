@@ -1,0 +1,32 @@
+# Local reports and recovery metadata contain installation paths.
+*.json
+*.json.tmp
+reports/
+backups/
+backup/
+BL4-range-backup*/
+
+# Recovery data and game assets must never be distributed.
+*.ranges.bin
+*.ucas
+*.utoc
+*.pak
+*.sig
+*.zip
+
+# Python / local development
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.coverage
+htmlcov/
+.env
+.env.*
+*.log
+*.tmp
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
