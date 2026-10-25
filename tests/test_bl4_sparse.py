@@ -6,6 +6,7 @@ from pathlib import Path
 import random
 import struct
 import sys
+import subprocess
 import tempfile
 import unittest
 from unittest import mock
@@ -199,7 +200,7 @@ class TestPrompts(unittest.TestCase):
     def test_interactive_audit_only_does_not_apply(self):
         plan={"targets":[{}],"candidate_bytes":1024}
         with mock.patch.object(m,"prompt_path",side_effect=[Path("game"),None]), \
-             mock.patch.object(m,"run_audit",return_value=(plan,Path("report.json"))), \
+             mock.patch.object(m,"run_audit",return_value=(plan,Path("report.json"),{"targets":[{}],"remaining_candidate_bytes":1024})), \
              mock.patch.object(m,"apply") as apply_mock,contextlib.redirect_stdout(io.StringIO()):
             m.interactive()
         apply_mock.assert_not_called()
@@ -208,7 +209,7 @@ class TestPrompts(unittest.TestCase):
     def test_interactive_cancel_does_not_apply(self):
         plan={"targets":[{}],"candidate_bytes":1024}
         with mock.patch.object(m,"prompt_path",side_effect=[Path("game"),Path("backup")]), \
-             mock.patch.object(m,"run_audit",return_value=(plan,Path("report.json"))), \
+             mock.patch.object(m,"run_audit",return_value=(plan,Path("report.json"),{"targets":[{}],"remaining_candidate_bytes":1024})), \
              mock.patch("builtins.input",return_value=""), \
              mock.patch.object(m,"apply") as apply_mock,contextlib.redirect_stdout(io.StringIO()):
             m.interactive()
@@ -218,7 +219,7 @@ class TestPrompts(unittest.TestCase):
     def test_interactive_passes_chosen_backup_and_confirmation(self):
         plan={"targets":[{}],"candidate_bytes":1024}
         with mock.patch.object(m,"prompt_path",side_effect=[Path("game"),Path("backup")]), \
-             mock.patch.object(m,"run_audit",return_value=(plan,Path("report.json"))), \
+             mock.patch.object(m,"run_audit",return_value=(plan,Path("report.json"),{"targets":[{}],"remaining_candidate_bytes":1024})), \
              mock.patch("builtins.input",return_value="APPLY"), \
              mock.patch.object(m,"apply") as apply_mock,contextlib.redirect_stdout(io.StringIO()):
             m.interactive()
@@ -227,7 +228,7 @@ class TestPrompts(unittest.TestCase):
     @unittest.skipUnless(sys.platform=="win32","Windows interactive workflow")
     def test_no_candidates_does_not_ask_for_backup(self):
         with mock.patch.object(m,"prompt_path",return_value=Path("game")) as prompt_mock, \
-             mock.patch.object(m,"run_audit",return_value=({"targets":[]},Path("report.json"))), \
+             mock.patch.object(m,"run_audit",return_value=({"targets":[]},Path("report.json"),{"targets":[]})), \
              mock.patch.object(m,"apply") as apply_mock,contextlib.redirect_stdout(io.StringIO()):
             m.interactive()
         self.assertEqual(prompt_mock.call_count,1)
@@ -264,11 +265,226 @@ class TestPrompts(unittest.TestCase):
             fixture(game,0,[(cid(1),0,BS)],[0],1)
             fixture(game,1,[(cid(1),0,BS)],[0],1)
             with mock.patch.object(m,"__file__",str(base/"tool"/"bl4_sparse.py")),contextlib.redirect_stdout(io.StringIO()):
-                _,first=m.run_audit(game)
-                _,second=m.run_audit(game)
+                _,first,_=m.run_audit(game)
+                _,second,_=m.run_audit(game)
             self.assertNotEqual(first,second)
             self.assertEqual(first.parent,base/"tool"/"reports")
             self.assertTrue(first.is_file() and second.is_file())
+
+
+class TestRepeatedRuns(unittest.TestCase):
+    def test_nonzero_detection_skips_holes_and_allocated_zero_padding(self):
+        f=io.BytesIO(b"A"*8+bytes(24)+b"B"*8+bytes(24))
+        self.assertEqual(m.nonzero_candidate_ranges(f,[[0,8],[8,32],[32,40],[40,64]],
+                                                   [[0,16],[24,48]]),[[0,8],[32,40]])
+
+    def test_nonzero_detection_handles_fragmented_extent_boundaries(self):
+        f=io.BytesIO(bytes(12)+b"X"+bytes(19))
+        self.assertEqual(m.nonzero_candidate_ranges(f,[[0,8],[8,24],[24,32]],
+                                                   [[4,14],[20,28]]),[[8,24]])
+
+    @unittest.skipUnless(sys.platform=="win32","Windows sparse rerun integration")
+    def test_repeated_apply_creates_no_backup_and_preserves_original_recovery(self):
+        with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as temp:
+            base=Path(temp);game=base/"Paks";game.mkdir()
+            old=fixture(game,0,[(cid(1),0,BS)],[0],1)
+            fixture(game,1,[(cid(1),0,BS)],[0],1)
+            original=old.read_bytes()
+            planfile=base/"first-plan.json";m.save_json(planfile,m.audit(game))
+            with contextlib.redirect_stdout(io.StringIO()):
+                m.apply(planfile,base/"first-backup",True)
+            first_backup={p.name:p.read_bytes() for p in (base/"first-backup").iterdir()}
+            second=base/"second-plan.json";m.save_json(second,m.audit(game))
+            with contextlib.redirect_stdout(io.StringIO()) as output:
+                status=m.inspect_candidates(m.audit(game))
+                m.apply(second,base/"second-backup",True)
+            self.assertEqual(status["remaining_candidate_bytes"],0)
+            self.assertEqual(status["already_zero_candidate_bytes"],BS)
+            self.assertFalse((base/"second-backup").exists())
+            self.assertIn("Nothing further to optimize",output.getvalue())
+            self.assertEqual(first_backup,{p.name:p.read_bytes() for p in (base/"first-backup").iterdir()})
+            with contextlib.redirect_stdout(io.StringIO()):
+                m.restore(base/"first-backup"/"restore.json")
+            self.assertEqual(old.read_bytes(),original)
+
+    @unittest.skipUnless(sys.platform=="win32","Windows sparse rerun integration")
+    def test_partly_processed_file_keeps_only_intervals_with_nonzero_bytes(self):
+        with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as temp:
+            base=Path(temp);game=base/"Paks";game.mkdir()
+            old=fixture(game,0,[(cid(1),0,BS),(cid(2),BS,BS),(cid(3),2*BS,BS)],
+                        [0,BS,2*BS],3)
+            fixture(game,1,[(cid(1),0,BS),(cid(3),BS,BS)],[0,BS],2)
+            api=m.Windows()
+            with api.open(old,True) as f:
+                api.punch(f,[[0,BS]])
+            with contextlib.redirect_stdout(io.StringIO()):
+                status=m.inspect_candidates(m.audit(game))
+            self.assertEqual(status["remaining_candidate_bytes"],BS)
+            self.assertEqual(status["targets"][0]["ranges"],[[2*BS,3*BS]])
+
+    @unittest.skipUnless(sys.platform=="win32","Windows guided rerun workflow")
+    def test_interactive_already_zero_does_not_prompt_for_backup(self):
+        plan={"targets":[{}],"candidate_bytes":1024}
+        status={"targets":[],"remaining_candidate_bytes":0,"already_zero_candidate_bytes":1024}
+        with mock.patch.object(m,"prompt_path",return_value=Path("game")) as prompt_mock, \
+             mock.patch.object(m,"run_audit",return_value=(plan,Path("report.json"),status)), \
+             mock.patch.object(m,"apply") as apply_mock,contextlib.redirect_stdout(io.StringIO()):
+            m.interactive()
+        self.assertEqual(prompt_mock.call_count,1)
+        apply_mock.assert_not_called()
+
+    @unittest.skipUnless(sys.platform=="win32","Windows allocated extent query")
+    def test_allocation_query_handles_multiple_output_pages(self):
+        class FakeKernel:
+            def DeviceIoControl(self,handle,code,query,query_size,output,output_size,count,unused):
+                import ctypes
+                import ctypes.wintypes as W
+                offset,length=struct.unpack("<qq",query.raw[:16])
+                records=struct.pack("<qq",offset,10)
+                ctypes.memmove(output,records,len(records))
+                ctypes.cast(count,ctypes.POINTER(W.DWORD))[0]=len(records)
+                if offset==0:
+                    ctypes.set_last_error(234)
+                    return False
+                return True
+        api=m.Windows();api.k=FakeKernel()
+        with tempfile.TemporaryFile() as f:
+            self.assertEqual(api.allocated_ranges(f,20),[[0,20]])
+
+
+class TestNoBackup(unittest.TestCase):
+    def test_api_requires_separate_data_loss_acknowledgement(self):
+        with self.assertRaisesRegex(ValueError,"separate permanent-data-loss"):
+            m.apply("not-opened.json",None,True,no_backup=True)
+        with self.assertRaisesRegex(ValueError,"Cannot combine"):
+            m.apply("not-opened.json","backup",True,no_backup=True,no_backup_confirmed=True)
+        with self.assertRaisesRegex(ValueError,"backup folder is required"):
+            m.apply("not-opened.json",None,True)
+
+    def test_typed_confirmations_cancel_on_either_mismatch(self):
+        for answers in [[""],["APPLY"],["I ACCEPT PERMANENT DATA LOSS",""],["I ACCEPT PERMANENT DATA LOSS","apply"]]:
+            with mock.patch("builtins.input",side_effect=answers) as prompt,contextlib.redirect_stdout(io.StringIO()):
+                self.assertFalse(m.confirm_no_backup())
+                self.assertEqual(prompt.call_count,len(answers))
+
+    def test_no_backup_requires_both_exact_phrases(self):
+        with mock.patch("builtins.input",side_effect=["I ACCEPT PERMANENT DATA LOSS","DELETE WITHOUT BACKUP"]), \
+             contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertTrue(m.confirm_no_backup())
+        for warning in ["PERMANENT", "NO range backup", "NO automatic rollback", "partial modification",
+                        "Kept-byte hashes", "reinstall", "CANNOT restore"]:
+            self.assertIn(warning,output.getvalue())
+
+    def test_cli_rejects_combining_backup_and_no_backup(self):
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as error:
+            m.main(["apply","plan.json","--backup","backup","--no-backup"])
+        self.assertEqual(error.exception.code,2)
+
+    def test_cli_accept_flag_cannot_skip_no_backup_confirmation(self):
+        with mock.patch("builtins.input",side_effect=[""]) as prompt, \
+             mock.patch.object(m,"apply") as apply_mock,contextlib.redirect_stdout(io.StringIO()):
+            m.main(["apply","plan.json","--no-backup","--accept-unverified-patch-order"])
+        prompt.assert_called_once()
+        apply_mock.assert_not_called()
+
+    def test_cli_confirmed_no_backup_never_asks_for_backup_folder(self):
+        with mock.patch("builtins.input",side_effect=["I ACCEPT PERMANENT DATA LOSS","DELETE WITHOUT BACKUP"]) as prompt, \
+             mock.patch.object(m,"prompt_path",side_effect=AssertionError("unexpected backup prompt")), \
+             mock.patch.object(m,"apply") as apply_mock,contextlib.redirect_stdout(io.StringIO()):
+            m.main(["apply","plan.json","--no-backup"])
+        self.assertEqual(prompt.call_count,2)
+        apply_mock.assert_called_once_with(Path("plan.json").resolve(),None,True,
+                                          no_backup=True,no_backup_confirmed=True)
+
+    def test_guided_flag_is_forwarded_explicitly(self):
+        with mock.patch.object(m,"interactive") as guided:
+            m.main(["--no-backup"])
+        guided.assert_called_once_with(no_backup=True)
+
+    @unittest.skipUnless(sys.platform=="win32","Windows no-backup guided workflow")
+    def test_guided_cancellation_never_applies(self):
+        plan={"targets":[{}]}
+        status={"targets":[{}],"remaining_candidate_bytes":BS}
+        with mock.patch.object(m,"prompt_path",return_value=Path("game")) as path_prompt, \
+             mock.patch.object(m,"run_audit",return_value=(plan,Path("plan.json"),status)), \
+             mock.patch("builtins.input",return_value=""), \
+             mock.patch.object(m,"apply") as apply_mock,contextlib.redirect_stdout(io.StringIO()):
+            m.interactive(no_backup=True)
+        self.assertEqual(path_prompt.call_count,1)
+        apply_mock.assert_not_called()
+
+    @unittest.skipUnless(sys.platform=="win32","Windows no-backup integration")
+    def test_no_backup_preserves_retained_bytes_and_cannot_restore(self):
+        with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as temp:
+            base=Path(temp);game=base/"Paks";game.mkdir()
+            old=fixture(game,0,[(cid(1),0,BS),(cid(2),BS,BS)],[0,BS],2)
+            fixture(game,1,[(cid(1),0,BS)],[0],1)
+            original={p.name:p.read_bytes() for p in game.iterdir()}
+            plan=base/"plan.json";m.save_json(plan,m.audit(game))
+            with contextlib.redirect_stdout(io.StringIO()) as output:
+                m.apply(plan,None,True,no_backup=True,no_backup_confirmed=True)
+            self.assertIn("NO BACKUP WAS CREATED",output.getvalue())
+            self.assertEqual(old.read_bytes(),bytes(BS)+original[old.name][BS:])
+            for name,data in original.items():
+                if name!=old.name:self.assertEqual((game/name).read_bytes(),data)
+            self.assertFalse(list(base.rglob("*.ranges.bin")))
+            self.assertFalse(list(base.rglob("restore.json")))
+            reports=list(base.glob("*.no-backup-*.json"))
+            self.assertEqual(len(reports),1)
+            journal=json.loads(reports[0].read_text())
+            self.assertFalse(journal["recoverable"])
+            self.assertEqual(journal["state"],"complete")
+            with self.assertRaisesRegex(ValueError,"NO-BACKUP diagnostic"):
+                m.restore(reports[0])
+
+    @unittest.skipUnless(sys.platform=="win32","Windows no-backup failure integration")
+    def test_no_backup_failure_reports_no_rollback(self):
+        with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as temp:
+            base=Path(temp);game=base/"Paks";game.mkdir()
+            fixture(game,0,[(cid(1),0,BS)],[0],1)
+            fixture(game,1,[(cid(1),0,BS)],[0],1)
+            plan=base/"plan.json";m.save_json(plan,m.audit(game))
+            real=m.Windows.punch
+            def fail_after_write(api,f,ranges):
+                real(api,f,ranges)
+                raise OSError("simulated interruption")
+            with mock.patch.object(m.Windows,"punch",fail_after_write),contextlib.redirect_stdout(io.StringIO()), \
+                 contextlib.redirect_stderr(io.StringIO()) as errors:
+                with self.assertRaises(OSError):
+                    m.apply(plan,None,True,no_backup=True,no_backup_confirmed=True)
+            self.assertIn("cannot roll it back",errors.getvalue())
+            report=next(base.glob("*.no-backup-*.json"))
+            self.assertEqual(json.loads(report.read_text())["state"],"writing")
+            self.assertFalse(list(base.rglob("*.ranges.bin")))
+
+
+    @unittest.skipUnless(sys.platform=="win32","Windows no-backup subprocess workflow")
+    def test_real_guided_cli_cancel_apply_and_repeat(self):
+        with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as temp:
+            base=Path(temp);game=base/"Game [example]"/"OakGame"/"Content"/"Paks";game.mkdir(parents=True)
+            old=fixture(game,0,[(cid(1),0,BS),(cid(2),BS,BS)],[0,BS],2)
+            fixture(game,1,[(cid(1),0,BS)],[0],1)
+            original=old.read_bytes()
+            tool=base/"tool";tool.mkdir();script=tool/"bl4_sparse.py"
+            script.write_bytes(SCRIPT.read_bytes())
+            def run(answers):
+                result=subprocess.run([sys.executable,str(script),"--no-backup"],
+                                      input=answers,text=True,capture_output=True,timeout=30)
+                self.assertEqual(result.returncode,0,result.stdout+result.stderr)
+                return result.stdout
+            output=run(str(game)+"\n\n")
+            self.assertIn("Cancelled. No game files changed.",output)
+            self.assertEqual(old.read_bytes(),original)
+            output=run(str(game)+"\nI ACCEPT PERMANENT DATA LOSS\nDELETE WITHOUT BACKUP\n")
+            self.assertIn("NO BACKUP WAS CREATED",output)
+            self.assertEqual(old.read_bytes(),bytes(BS)+original[BS:])
+            self.assertFalse(list(base.rglob("*.ranges.bin")))
+            self.assertFalse(list(base.rglob("restore.json")))
+            self.assertEqual(len(list(tool.rglob("*.no-backup-*.json"))),1)
+            output=run(str(game)+"\n")
+            self.assertIn("Already-zero candidate data needs no new backup",output)
+            self.assertNotIn("Type I ACCEPT",output)
+            self.assertEqual(len(list(tool.rglob("*.no-backup-*.json"))),1)
 
 
 if __name__=="__main__":

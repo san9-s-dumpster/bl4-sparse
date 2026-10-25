@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """BL4 sparse patch experiment. Python 3.10+, no third-party packages.
-Audit is read-only. Apply requires a backup and acknowledgement of unverified
-runtime patch precedence. Only .ucas files change; .pak/.utoc remain intact.
+Audit is read-only. Backups are the default. DANGEROUS no-backup mode requires
+two typed confirmations. Runtime patch precedence is unverified. Only .ucas
+files change; .pak/.utoc remain intact.
 """
 import argparse
 import contextlib
@@ -122,6 +123,35 @@ class Windows:
         if low == 0xffffffff and ctypes.get_last_error():
             raise ctypes.WinError(ctypes.get_last_error())
         return (high.value << 32) | low
+
+    def allocated_ranges(self, f, size):
+        """Query NTFS extents; holes outside these ranges read as zero."""
+        import msvcrt
+        cursor, ranges = 0, []
+        while cursor < size:
+            query = ctypes.create_string_buffer(struct.pack("<qq", cursor, size - cursor))
+            output = ctypes.create_string_buffer(65536)
+            count = W.DWORD()
+            ok = self.k.DeviceIoControl(
+                msvcrt.get_osfhandle(f.fileno()), 0x940CF, query, 16,
+                output, len(output), ctypes.byref(count), None)
+            error = ctypes.get_last_error() if not ok else 0
+            if not ok and error != 234:  # ERROR_MORE_DATA
+                raise ctypes.WinError(error)
+            require(count.value % 16 == 0, "Invalid allocated-range response")
+            page = []
+            for pos in range(0, count.value, 16):
+                offset, length = struct.unpack_from("<qq", output.raw, pos)
+                require(offset >= 0 and length > 0, "Invalid allocated extent")
+                page.append([offset, offset + length])
+            ranges.extend([max(cursor, a), min(size, b)] for a, b in page
+                          if max(cursor, a) < min(size, b))
+            if ok:
+                break
+            require(page and page[-1][1] > cursor, "Allocated-range query made no progress")
+            cursor = page[-1][1]
+        return merge(ranges)
+
 
     def ntfs(self, path):
         volume, fs = ctypes.create_unicode_buffer(32768), ctypes.create_unicode_buffer(256)
@@ -252,6 +282,77 @@ def audit(root):
         logical_bytes=sum(s["size"] for s in snapshots.values()),language_10_to_16_logical_bytes=lang,
         assumption="Higher numeric _N_P overrides the same chunk ID within its pakchunk family. Runtime unverified.")
 
+def nonzero_candidate_ranges(f, candidates, allocated):
+    """Keep complete candidate intervals containing any allocated, nonzero bytes."""
+    eligible, j = [], 0
+    allocated = merge(allocated)
+    for a, b in candidates:
+        while j < len(allocated) and allocated[j][1] <= a:
+            j += 1
+        k, found = j, False
+        while k < len(allocated) and allocated[k][0] < b and not found:
+            start, end = max(a, allocated[k][0]), min(b, allocated[k][1])
+            if start < end:
+                f.seek(start)
+                left = end - start
+                while left:
+                    data = f.read(min(left, BUFFER))
+                    require(data, "Unexpected EOF checking existing sparse holes")
+                    if data.strip(b"\0"):
+                        found = True
+                        break
+                    left -= len(data)
+            k += 1
+        if found:
+            eligible.append([a, b])
+    return eligible
+
+
+def inspect_candidates(plan, handles=None):
+    """Separate index candidates from ranges that still contain stored data.
+
+    Kept separate from the saved index plan for compatibility with older plans
+    and restore manifests. Rechecked under the apply locks before any backup.
+    """
+    import time
+    root = Path(plan["root"])
+    api = Windows() if os.name == "nt" else None
+    active, last_update, announced = [], time.monotonic(), False
+    for index, target in enumerate(plan["targets"]):
+        name = target["file"]
+        if api is None:
+            active.append(dict(target))
+            continue
+        with contextlib.ExitStack() as stack:
+            f = handles[name] if handles is not None else stack.enter_context(api.open(root / name))
+            before = os.fstat(f.fileno())
+            expected = plan["files"][name]
+            require(before.st_size == expected["size"] and before.st_mtime_ns == expected["mtime_ns"],
+                    f"{name} changed; run audit again")
+            # Unsparsed files have no previous sparse-hole optimization to skip.
+            if getattr(before, "st_file_attributes", 0) & 0x200:
+                if not announced:
+                    print("Checking previously sparse files for remaining nonzero data (read-only)...", flush=True)
+                    announced = True
+                allocated = api.allocated_ranges(f, before.st_size)
+                ranges = nonzero_candidate_ranges(f, target["ranges"], allocated)
+            else:
+                ranges = target["ranges"]
+            after = os.fstat(f.fileno())
+            require((before.st_size, before.st_mtime_ns) == (after.st_size, after.st_mtime_ns),
+                    f"{name} changed during sparse-range check")
+            if ranges:
+                active.append(dict(target, ranges=ranges, bytes=total(ranges)))
+        if time.monotonic() - last_update >= 5:
+            print(f"Checked {index + 1}/{len(plan['targets'])} candidate files...", flush=True)
+            last_update = time.monotonic()
+    remaining = sum(t["bytes"] for t in active)
+    return dict(targets=active, remaining_candidate_bytes=remaining,
+                already_zero_candidate_bytes=plan["candidate_bytes"] - remaining,
+                whole_64k_remaining_bytes=sum(max(0, (b // 65536 - (a + 65535) // 65536) * 65536)
+                    for t in active for a, b in t["ranges"]))
+
+
 def hash_ranges(f,ranges,output=None):
     h=hashlib.sha256()
     for a,b in ranges:
@@ -309,8 +410,12 @@ def child(folder,name):
     require(not p.is_symlink(),"Backup/target symlink refused")
     return p
 
-def apply(plan_file,backup_dir,acknowledge):
+def apply(plan_file,backup_dir,acknowledge,*,no_backup=False,no_backup_confirmed=False):
     require(acknowledge,"Apply requires --accept-unverified-patch-order; read README first")
+    require(not no_backup or no_backup_confirmed,
+            "No-backup mode requires separate permanent-data-loss confirmations")
+    require(not no_backup or backup_dir is None, "Cannot combine --backup and --no-backup")
+    require(no_backup or backup_dir is not None, "A backup folder is required unless --no-backup is explicit")
     old=json.loads(Path(plan_file).read_text(encoding="utf-8"))
     require(old.get("schema")==1,"Unsupported plan")
     print("Rebuilding plan from game indexes, ignoring supplied byte ranges...",flush=True)
@@ -320,62 +425,80 @@ def apply(plan_file,backup_dir,acknowledge):
     api=Windows()
     root=Path(plan["root"])
     api.ntfs(root)
-    backup=Path(backup_dir).resolve()
-    require(not backup.exists(),"Use a NEW backup directory; existing backups are never overwritten")
-    require(backup!=root and root not in backup.parents,"Backup must be outside Paks")
-    require(backup.parent.is_dir(),"Backup parent folder must already exist")
-    require(shutil.disk_usage(backup.parent).free>plan["candidate_bytes"]+128*1024**2,"Insufficient backup space")
-    if backup.anchor.lower()==root.anchor.lower():
-        print("Backup is on the game drive: total drive use can INCREASE until you move the backup.",flush=True)
-    backup.mkdir()
-    journal=dict(schema=1,root=str(root),toc_hashes=plan["toc_hashes"],entries=[],state="preparing",
-                 assumption=plan["assumption"])
-    manifest=backup/"restore.json"
-    save_json(manifest,journal)
     before=sum(api.allocated(root/name) for name in plan["files"])
     with contextlib.ExitStack() as stack:
         handles=locked_files(api,plan,stack)
-        # All removed bytes are flushed, reread and journaled before ANY holes.
-        for number,target in enumerate(plan["targets"]):
-            name,ranges=target["file"],target["ranges"]
-            f=handles[name]
-            size=plan["files"][name]["size"]
-            print(f"Backing up {number+1}/{len(plan['targets'])}: {name} ({gib(target['bytes'])})",flush=True)
-            preserved=hash_ranges(f,kept(size,ranges))
-            bin_name=f"{number:04d}.ranges.bin"
-            with (backup/bin_name).open("xb") as out:
-                removed=hash_ranges(f,ranges,out)
-                out.flush()
-                os.fsync(out.fileno())
-            with (backup/bin_name).open("rb") as check:
-                require(backup_hash(check,ranges)==removed,"Backup verification failed")
-            journal["entries"].append(dict(file=name,size=size,ranges=ranges,backup=bin_name,
-                removed_sha256=removed,kept_sha256=preserved,state="backed-up"))
+        status=inspect_candidates(plan,handles)
+        if not status["targets"]:
+            print("All indexed candidate ranges already read as zeros. Nothing further to optimize.")
+            print("No new backup was created and no game files were changed. Keep any existing recovery backup.")
+            return
+        if no_backup:
+            diagnostic_report=apply_without_backup(api,handles,plan,status["targets"],plan_file)
+        else:
+            backup=Path(backup_dir).resolve()
+            require(not backup.exists(),"Use a NEW backup directory; existing backups are never overwritten")
+            require(backup!=root and root not in backup.parents,"Backup must be outside Paks")
+            require(backup.parent.is_dir(),"Backup parent folder must already exist")
+            require(shutil.disk_usage(backup.parent).free>status["remaining_candidate_bytes"]+128*1024**2,
+                    "Insufficient backup space")
+            if backup.anchor.lower()==root.anchor.lower():
+                print("Backup is on the game drive: total drive use can INCREASE until you move the backup.",flush=True)
+            backup.mkdir()
+            journal=dict(schema=1,root=str(root),toc_hashes=plan["toc_hashes"],entries=[],state="preparing",
+                         assumption=plan["assumption"])
+            manifest=backup/"restore.json"
             save_json(manifest,journal)
-        journal["state"]="backups-complete"
-        save_json(manifest,journal)
-        for e in journal["entries"]:
-            f=handles[e["file"]]
-            e["state"]="punching"  # Persist intent before the first ioctl.
+            # All removed bytes are flushed, reread and journaled before ANY holes.
+            targets=status["targets"]
+            for number,target in enumerate(targets):
+                name,ranges=target["file"],target["ranges"]
+                f=handles[name]
+                size=plan["files"][name]["size"]
+                print(f"Backing up {number+1}/{len(targets)}: {name} ({gib(target['bytes'])})",flush=True)
+                preserved=hash_ranges(f,kept(size,ranges))
+                bin_name=f"{number:04d}.ranges.bin"
+                with (backup/bin_name).open("xb") as out:
+                    removed=hash_ranges(f,ranges,out)
+                    out.flush()
+                    os.fsync(out.fileno())
+                with (backup/bin_name).open("rb") as check:
+                    require(backup_hash(check,ranges)==removed,"Backup verification failed")
+                journal["entries"].append(dict(file=name,size=size,ranges=ranges,backup=bin_name,
+                    removed_sha256=removed,kept_sha256=preserved,state="backed-up"))
+                save_json(manifest,journal)
+            journal["state"]="backups-complete"
             save_json(manifest,journal)
-            print(f"Making sparse holes: {e['file']}",flush=True)
-            api.punch(f,e["ranges"])
-            require(os.fstat(f.fileno()).st_size==e["size"],"File length changed")
-            require(hash_ranges(f,kept(e["size"],e["ranges"]))==e["kept_sha256"],
-                    "KEPT BYTES CHANGED: stop and recover from backup")
-            e["state"]="verified"
+            for e in journal["entries"]:
+                f=handles[e["file"]]
+                e["state"]="punching"
+                save_json(manifest,journal)
+                print(f"Making sparse holes: {e['file']}",flush=True)
+                api.punch(f,e["ranges"])
+                require(os.fstat(f.fileno()).st_size==e["size"],"File length changed")
+                require(hash_ranges(f,kept(e["size"],e["ranges"]))==e["kept_sha256"],
+                        "KEPT BYTES CHANGED: stop and recover from backup")
+                e["state"]="verified"
+                save_json(manifest,journal)
+            journal["state"]="complete"
             save_json(manifest,journal)
-        journal["state"]="complete"
-        save_json(manifest,journal)
     after=sum(api.allocated(root/name) for name in plan["files"])
     print(f"Container allocation reclaimed: {gib(before-after)}")
-    print(f"Recovery manifest: {manifest}")
-    print("Kept bytes verified. Runtime correctness still unverified. Keep your backup.")
+    if no_backup:
+        print("NO BACKUP WAS CREATED. This run has no script recovery or rollback.")
+        print(f"Diagnostic report ONLY (cannot restore data): {diagnostic_report}")
+        print("Kept bytes verified; runtime correctness is unverified. Repair/reinstall may still be needed.")
+    else:
+        print(f"Recovery manifest: {manifest}")
+        print("Kept bytes verified. Runtime correctness still unverified. Keep your backup.")
+
 
 def restore(manifest):
     manifest=Path(manifest).resolve(strict=True)
     journal=json.loads(manifest.read_text(encoding="utf-8"))
     require(journal.get("schema")==1,"Unsupported recovery manifest")
+    require(journal.get("recoverable",True) and journal.get("mode") != "no-backup",
+            "This is a NO-BACKUP diagnostic report. It contains no original bytes and cannot restore the game.")
     root=paks_dir(journal["root"])
     api=Windows()
     with contextlib.ExitStack() as stack:
@@ -449,6 +572,77 @@ def prompt_path(label, kind, optional=False):
             print(f"Invalid path: {error}", flush=True)
 
 
+def confirm_no_backup():
+    print("\n" + "!" * 72)
+    print("DANGER: NO BACKUP - STRONGLY DISCOURAGED")
+    print("!" * 72)
+    warnings = [
+        "Removed game bytes will be PERMANENTLY DISCARDED from these files.",
+        "There will be NO range backup, NO restore.json and NO automatic rollback.",
+        "The patch-priority assumption is experimental and may be wrong.",
+        "The game can boot successfully and still fail later in a map, quest or DLC.",
+        "Kept-byte hashes do NOT prove the removed data was safe to discard.",
+        "An interruption, disk error or script failure can leave a partial modification.",
+        "Repairing/reinstalling may require large downloads, extra free space and time.",
+        "Do NOT continue if you cannot repair or reinstall this exact game build.",
+    ]
+    for number, warning in enumerate(warnings, 1):
+        print(f"{number}. {warning}")
+    print("RECOMMENDED: cancel and keep a backup on another drive.")
+    print("This mode still writes a small diagnostic report. That report CANNOT restore data.")
+    first = input("\nType I ACCEPT PERMANENT DATA LOSS to continue, or Enter to cancel: ").strip()
+    if first != "I ACCEPT PERMANENT DATA LOSS":
+        return False
+    print("\nFINAL WARNING: you are choosing irreversible deletion without recovery data.")
+    return input("Type DELETE WITHOUT BACKUP to authorize the write pass: ").strip() == "DELETE WITHOUT BACKUP"
+
+
+def apply_without_backup(api, handles, plan, targets, plan_file):
+    """No original bytes are saved. The JSON report is diagnostic, never recovery."""
+    from uuid import uuid4
+    plan_file = Path(plan_file).resolve()
+    report = plan_file.with_name(f"{plan_file.stem}.no-backup-{uuid4().hex[:8]}.json")
+    journal = dict(schema=1, mode="no-backup", recoverable=False, root=plan["root"],
+                   plan=str(plan_file), state="hashing", entries=[],
+                   warning="NO ORIGINAL BYTES SAVED. This report cannot restore the game.")
+    save_json(report, journal)
+    writing_started = False
+    try:
+        # Retained-byte verification stays enabled; hash all files before writing.
+        for number, target in enumerate(targets):
+            name, ranges = target["file"], target["ranges"]
+            size = plan["files"][name]["size"]
+            print(f"NO BACKUP: hashing retained bytes {number + 1}/{len(targets)}: {name}", flush=True)
+            digest = hash_ranges(handles[name], kept(size, ranges))
+            journal["entries"].append(dict(file=name, size=size, kept_sha256=digest,
+                                           selected_bytes=target["bytes"],
+                                           range_count=len(ranges), state="hashed"))
+            save_json(report, journal)
+        print("\nDANGER: permanently discarding selected bytes now. NO BACKUP EXISTS FOR THIS RUN.", flush=True)
+        for entry, target in zip(journal["entries"], targets):
+            f, ranges = handles[entry["file"]], target["ranges"]
+            entry["state"] = "punching"
+            journal["state"] = "writing"
+            save_json(report, journal)
+            writing_started = True
+            print(f"NO BACKUP - making sparse holes: {entry['file']}", flush=True)
+            api.punch(f, ranges)
+            require(os.fstat(f.fileno()).st_size == entry["size"], "File length changed")
+            require(hash_ranges(f, kept(entry["size"], ranges)) == entry["kept_sha256"],
+                    "KEPT BYTES CHANGED. NO BACKUP EXISTS FOR THIS RUN; repair/reinstall may be required.")
+            entry["state"] = "verified"
+            save_json(report, journal)
+        journal["state"] = "complete"
+        save_json(report, journal)
+    except BaseException:
+        if writing_started:
+            print("\nNO-BACKUP RUN INTERRUPTED/FAILED. Original bytes were not saved.", file=sys.stderr)
+            print("The game may be partly modified. This script cannot roll it back.", file=sys.stderr)
+            print("Repair/reinstall may be required. Diagnostic report: " + str(report), file=sys.stderr)
+        raise
+    return report
+
+
 def confirm_apply():
     print("\nExperimental: numeric patch priority has not been verified against every")
     print("Borderlands 4 runtime read. Kept-byte hashes do not prove removed data is unused.")
@@ -472,8 +666,8 @@ def run_audit(game, out=None):
     out.parent.mkdir(parents=True, exist_ok=True)
     save_json(out, plan)
     print(f"Container logical size: {gib(plan['logical_bytes'])}")
-    print(f"Candidate superseded blocks/padding: {gib(plan['candidate_bytes'])}")
-    print(f"Whole 64-KiB regions within candidates: {gib(plan['whole_64k_candidate_bytes'])}; estimate only")
+    print(f"Indexed obsolete ranges: {gib(plan['candidate_bytes'])} (includes any already-zeroed data)")
+
     for family, amount in sorted(plan["by_family"].items()):
         print(f"  {family}: {gib(amount)}")
     if plan["language_10_to_16_logical_bytes"]:
@@ -481,23 +675,41 @@ def run_audit(game, out=None):
     if os.name == "nt":
         api = Windows()
         print(f"Current allocated container size: {gib(sum(api.allocated(root / n) for n in plan['files']))}")
+    status = inspect_candidates(plan)
+    print(f"Already-zero candidate ranges: {gib(status['already_zero_candidate_bytes'])}")
+    print(f"Remaining candidate ranges to process: {gib(status['remaining_candidate_bytes'])}")
+    print(f"Remaining whole 64-KiB regions: {gib(status['whole_64k_remaining_bytes'])}; estimate only")
+    if plan['targets'] and not status['targets']:
+        print("All indexed candidate ranges already read as zeros. Nothing further to optimize.")
     print(f"Plan: {out}\nRead-only audit complete. No game files changed.")
     print("Assumption: " + plan["assumption"])
-    return plan, out
+    return plan, out, status
 
 
-def interactive():
+def interactive(no_backup=False):
     require(os.name == "nt", "The interactive optimizer requires Windows and NTFS")
     print("BL4 Sparse - experimental IoStore patch optimizer")
     print("A read-only scan runs first. Press Ctrl+C at a prompt to exit.\n")
+    if no_backup:
+        print("WARNING: no-backup mode selected. Strongly discouraged; extra confirmations will be required.\n")
     game = prompt_path("Game directory (or OakGame\\Content\\Paks folder)", "game")
-    plan, report = run_audit(game)
+    plan, report, status = run_audit(game)
     if not plan["targets"]:
         print("No candidate data found. Nothing to apply.")
         return
-    print(f"\nBackup data needs approximately {gib(plan['candidate_bytes'])}, plus a small reserve.")
+    if not status["targets"]:
+        print("Already-zero candidate data needs no new backup. Keep any existing recovery backup.")
+        return
+    if no_backup:
+        if not confirm_no_backup():
+            print("Cancelled. No game files changed.")
+            return
+        apply(report, None, True, no_backup=True, no_backup_confirmed=True)
+        return
+    print(f"\nBackup data needs approximately {gib(status['remaining_candidate_bytes'])}, plus a small reserve.")
     print("Choose another drive to free space on the game drive.")
     print("Using the same drive can consume MORE space until the backup is moved.")
+    print("Dangerous no-backup mode is a separate explicit option: --no-backup. Backups are strongly recommended.")
     backup = prompt_path("NEW backup folder (Enter to finish after the read-only scan)", "backup", optional=True)
     if backup is None:
         print("Finished after audit. No game files changed.")
@@ -510,30 +722,48 @@ def interactive():
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--no-backup", dest="interactive_no_backup", action="store_true",
+                        help="DANGEROUS guided mode: discard data without recovery; always requires two typed confirmations")
     sub = parser.add_subparsers(dest="command")
     a = sub.add_parser("audit", help="Read-only index analysis; prompts for an omitted game path")
     a.add_argument("game", nargs="?", help="Game root or Paks folder")
     a.add_argument("--out", help="New JSON report path; defaults to a unique file in reports/")
-    a = sub.add_parser("apply", help="Apply a saved plan with a mandatory recovery backup")
+    a = sub.add_parser("apply", help="Apply a saved plan; backups are the default and strongly recommended")
     a.add_argument("plan", nargs="?", help="JSON plan; prompts when omitted")
-    a.add_argument("--backup", help="NEW directory; prompts when omitted")
+    backup_options = a.add_mutually_exclusive_group()
+    backup_options.add_argument("--backup", help="NEW directory; prompts when omitted")
+    backup_options.add_argument("--no-backup", action="store_true",
+                                help="DANGEROUS: permanently discard data without recovery; two confirmations required")
     a.add_argument("--accept-unverified-patch-order", action="store_true",
-                   help="Explicitly accept the runtime assumption without an interactive confirmation")
+                   help="Accept patch priority without prompting in backed-up mode; NEVER skips no-backup confirmations")
     a = sub.add_parser("restore", help="Restore original bytes from a backup; prompts when omitted")
     a.add_argument("manifest", nargs="?", help="Backup folder or restore.json")
     args = parser.parse_args(argv)
+    if args.interactive_no_backup and args.command is not None:
+        parser.error("Place --no-backup after 'apply' for a saved plan; use it alone for guided mode.")
     if args.command is None:
-        interactive()
+        if args.interactive_no_backup:
+            interactive(no_backup=True)
+        else:
+            interactive()
     elif args.command == "audit":
         game = clean_path(args.game) if args.game else prompt_path("Game directory (or Paks folder)", "game")
         run_audit(game, clean_path(args.out) if args.out else None)
     elif args.command == "apply":
         plan = clean_path(args.plan) if args.plan else prompt_path("Saved JSON plan", "plan")
-        backup = clean_path(args.backup) if args.backup else prompt_path("NEW backup folder", "backup")
-        if args.accept_unverified_patch_order or confirm_apply():
-            apply(plan, backup, True)
+        if args.no_backup:
+            # Intentionally no unattended override: even --accept-unverified-patch-order
+            # cannot bypass the separate permanent-data-loss confirmations.
+            if confirm_no_backup():
+                apply(plan, None, True, no_backup=True, no_backup_confirmed=True)
+            else:
+                print("Cancelled. No game files changed.")
         else:
-            print("Cancelled. No game files changed.")
+            backup = clean_path(args.backup) if args.backup else prompt_path("NEW backup folder", "backup")
+            if args.accept_unverified_patch_order or confirm_apply():
+                apply(plan, backup, True)
+            else:
+                print("Cancelled. No game files changed.")
     else:
         manifest = clean_path(args.manifest) if args.manifest else prompt_path("Backup folder or restore.json", "manifest")
         if manifest.is_dir():
@@ -541,11 +771,12 @@ def main(argv=None):
         restore(manifest)
 
 
+
 if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
-        print("\nCancelled. If sparse writes had started, keep the backup and use restore.json for recovery.",
+        print("\nCancelled. If writes had started, keep any recovery backup. No-backup runs have no script recovery.",
               file=sys.stderr)
         sys.exit(130)
     except EOFError:
@@ -553,5 +784,5 @@ if __name__ == "__main__":
         sys.exit(1)
     except (OSError, ValueError, KeyError, struct.error) as error:
         print(f"STOPPED: {error}", file=sys.stderr)
-        print("If apply started, preserve the backup folder and its restore.json.", file=sys.stderr)
+        print("If apply started, preserve any backup and restore.json. No-backup runs may require repair/reinstall.", file=sys.stderr)
         sys.exit(1)

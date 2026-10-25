@@ -2,10 +2,14 @@
 [CmdletBinding()]
 param(
     [ValidateSet('Interactive', 'Audit', 'Restore')]
-    [string]$Mode = 'Interactive'
+    [string]$Mode = 'Interactive',
+    [switch]$NoBackup
 )
 
 $ErrorActionPreference = 'Stop'
+if ($NoBackup -and $Mode -ne 'Interactive') {
+    throw '-NoBackup is only valid in Interactive mode. Audit and Restore do not discard data.'
+}
 $scriptPath = Join-Path $PSScriptRoot 'bl4_sparse.py'
 $runtime = $null
 $runtimeArgs = @()
@@ -42,6 +46,7 @@ if ($null -eq $runtime) {
 }
 
 $modeArgs = @()
+if ($NoBackup) { $modeArgs = @('--no-backup') }
 if ($Mode -eq 'Audit') { $modeArgs = @('audit') }
 if ($Mode -eq 'Restore') { $modeArgs = @('restore') }
 & $runtime @runtimeArgs $scriptPath @modeArgs

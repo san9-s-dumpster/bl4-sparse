@@ -15,8 +15,8 @@ quests and DLC. Savings vary by build and installation.
 - Python 3.10 or newer, available as py, python, or python3.
 - A supported stock IoStore layout: standard TOC version 8, unencrypted and
   unsigned, with one .ucas per .utoc and numeric _N_P patch names.
-- Enough free space for an uncompressed backup of every selected byte range,
-  plus a small reserve. The scan displays the required amount.
+- In the default backed-up mode, enough free space for an uncompressed backup
+  of every selected byte range, plus a small reserve. The scan displays the amount.
 
 No third-party Python packages, AES keys, downloads, telemetry, administrator
 session, or game-account credentials are needed. Normal permission to read and
@@ -40,7 +40,9 @@ The guided workflow:
 
 1. Enter the **game installation directory**, or its OakGame\Content\Paks folder.
    Paths containing spaces or brackets work; surrounding quotes are accepted.
-2. Wait for the **read-only scan** and review the reported candidate space.
+2. Wait for the **read-only scan** and review the remaining candidate space.
+   Previously sparse files are checked for already-zero ranges. If all selected
+   data is already zero, the workflow stops without asking for a backup.
 3. Enter a **new backup folder**. Its parent folder must already exist. Use
    another drive to free space on the drive holding the game.
    **Press Enter here to stop after the scan without modifying the game.**
@@ -73,7 +75,65 @@ The Python equivalent is:
 py -3 .\bl4_sparse.py audit
 ~~~
 
-### Restore
+## Dangerous option: no backup (strongly discouraged)
+
+**Use a backup on another drive instead whenever possible. No-backup mode is
+irreversible through this script. Do not use it unless you can repair or reinstall
+the game and accept the risk of doing so.**
+
+Before writing, the tool displays these warnings:
+
+1. Removed game bytes are **permanently discarded** from the modified files.
+2. There is **no range backup, no restore.json and no automatic rollback**.
+3. The patch-priority assumption is experimental and could select needed data.
+4. A successful launch does not validate every map, quest, save or DLC.
+5. Retained-byte hashes do not prove that removing the selected bytes is safe.
+6. An interruption, disk error or script failure can leave the game partly modified.
+7. Repair/reinstallation may require large downloads, extra free space and time.
+8. If you cannot repair or reinstall the affected game build, **cancel**.
+
+The option is deliberately separate from the normal backup workflow:
+
+~~~powershell
+.\bl4-sparse.ps1 -NoBackup
+~~~
+
+Or run the same guided mode directly:
+
+~~~powershell
+py -3 .\bl4_sparse.py --no-backup
+~~~
+
+For an existing plan:
+
+~~~powershell
+py -3 .\bl4_sparse.py apply "<plan.json>" --no-backup
+~~~
+
+Two exact typed acknowledgements are required:
+
+- I ACCEPT PERMANENT DATA LOSS
+- DELETE WITHOUT BACKUP
+
+A mismatch cancels before changing game bytes. There is **no unattended
+confirmation bypass** for this mode; even --accept-unverified-patch-order cannot
+skip the two acknowledgements. Combining --backup and --no-backup is rejected.
+
+The usual layout checks, file locks, retained-byte hashing and already-zero
+detection stay enabled. If nothing remains to process, the guided run stops
+without requesting destructive confirmation.
+
+No original bytes are saved. A small JSON diagnostic report is written next to
+the selected plan and marked **recoverable: false**. It is not a recovery
+manifest; Restore explicitly refuses it. Existing recovery backups are left
+alone, but an older backup may not cover the current run.
+
+Skipping the large backup avoids its temporary space increase. Small plans,
+diagnostic reports, temporary report files and filesystem metadata still require
+space. This mode does not promise to work on a completely full volume.
+
+
+## Restore from a recovery backup
 
 Close the game and launcher/updater, then run:
 
@@ -105,8 +165,16 @@ Use the launcher's repair function or your original installation backup instead.
 
 - **Logical size** is the file length seen by the game and Explorer's Size.
 - **Allocated size** is the storage currently occupied, shown as Size on disk.
-- **Candidate bytes** include selected older blocks and short alignment padding.
-- **Whole 64-KiB regions** provide an allocation estimate, not a guaranteed result.
+- **Indexed obsolete ranges** come from the unchanged container indexes. They
+  include older blocks and padding even after a successful optimization; this
+  number is not a claim of additional available savings.
+- **Already-zero candidate ranges** need no second processing pass. For sparse
+  files, NTFS allocation queries skip holes; allocated candidate portions are
+  read to check whether they contain any nonzero bytes.
+- **Remaining candidate ranges to process** excludes intervals already entirely
+  zero. This is the amount used for backup planning.
+- **Remaining whole 64-KiB regions** provide an allocation estimate for that
+  remaining work, not a guaranteed result.
 - After applying, **Container allocation reclaimed** reports the measured change.
 
 To check manually, right-click the game's Paks folder in Explorer, choose
@@ -116,6 +184,11 @@ To check manually, right-click the game's Paks folder in Explorer, choose
 Keep it on another drive, or move the entire folder there afterward. Net drive
 savings depend on the backup's location. Do not delete the backup until you are
 comfortable losing the ability to restore those original bytes.
+
+A repeat scan can still show a large indexed-obsolete total because indexes
+are preserved. If the remaining total is zero, no new backup or sparse-write pass
+is needed. The apply command independently repeats this check under file locks,
+including when using an older saved plan. Keep any existing recovery backup.
 
 The tool leaves language packs alone. If you remove languages or change any
 container files, generate a fresh audit before applying. Every game update also
@@ -157,9 +230,9 @@ py -3 .\bl4_sparse.py apply "<plan.json>" --backup "<new-backup-folder>"
 py -3 .\bl4_sparse.py restore "<backup-folder>"
 ~~~
 
-The apply command prompts for confirmation. For a deliberately unattended run,
-supply --accept-unverified-patch-order as an explicit acceptance of the runtime
-assumption. Omitted apply paths are prompted for. Reports are not overwritten.
+The apply command prompts for confirmation. For a deliberately unattended
+**backed-up** run, supply --accept-unverified-patch-order as an explicit acceptance
+of the runtime assumption. This flag cannot bypass no-backup confirmations. Omitted apply paths are prompted for. Reports are not overwritten.
 
 Do not reuse a stale plan after changing game files. The tool rebuilds and
 compares the plan, then holds file locks on the existing containers while working.
@@ -175,7 +248,10 @@ py -3 -m unittest discover -s tests -v
 Tests create synthetic containers in temporary folders. They cover range
 selection, shared/aliased block protection, alignment padding, rejected layouts,
 edited plans, the prompted workflow, Windows file locks, sparse writes,
-interruption recovery and byte-for-byte restoration. Windows integration tests
+interruption recovery, repeated-run detection, partial-run handling and
+byte-for-byte restoration. No-backup tests also cover opt-in, both confirmations,
+cancellation, retained-byte preservation, failure reporting and rejection of
+nonrecoverable diagnostic reports. Windows integration tests
 are skipped on other platforms. No installed game is modified by the tests.
 
 ## Publishing and privacy
@@ -208,6 +284,7 @@ personal author identity, commit, or hosted repository is supplied by this proje
 ## References
 
 - [Microsoft: sparse file operations](https://learn.microsoft.com/en-us/windows/win32/fileio/sparse-file-operations)
+- [Microsoft: querying allocated ranges](https://learn.microsoft.com/en-us/windows/win32/api/winioctl/ni-winioctl-fsctl_query_allocated_ranges)
 - [Microsoft: FSCTL_SET_ZERO_DATA](https://learn.microsoft.com/en-us/windows/win32/api/winioctl/ni-winioctl-fsctl_set_zero_data)
 - [CUE4Parse: IoStore header layout](https://github.com/FabianFG/CUE4Parse/blob/master/CUE4Parse/UE4/IO/Objects/FIoStoreTocHeader.cs)
 - [CUE4Parse: chunk offsets and lengths](https://github.com/FabianFG/CUE4Parse/blob/master/CUE4Parse/UE4/IO/Objects/FIoOffsetAndLength.cs)
